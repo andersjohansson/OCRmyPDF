@@ -30,12 +30,13 @@ from tqdm import tqdm
 
 from ocrmypdf import leptonica
 from ocrmypdf._concurrent import exec_progress_pool
-from ocrmypdf._exec import jbig2enc, pngquant
+from ocrmypdf._exec import jbig2enc, pngquant, userscript
 from ocrmypdf._jobcontext import PdfContext
 from ocrmypdf.exceptions import OutputFileAccessError
 from ocrmypdf.helpers import safe_symlink
 
 log = logging.getLogger(__name__)
+
 
 DEFAULT_JPEG_QUALITY = 75
 DEFAULT_PNG_QUALITY = 70
@@ -367,6 +368,67 @@ def transcode_jpegs(pike, jpegs, root, options):
         im_obj.write(compdata.read(), filter=Name.DCTDecode)
 
 
+def transcode_images_via_script_to_tif(pike, images, image_name_fn, root, log, options):
+    modified = set()
+    if options.user_script_jpg_to_1bpp_tif:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=options.jobs
+        ) as executor:
+            futures = []
+            for xref in images:
+                log.debug(image_name_fn(root, xref))
+                futures.append(
+                    executor.submit(
+                        userscript.runscript,
+                        image_name_fn(root, xref),
+                        tif_name(root, xref),
+                        options.user_script_jpg_to_1bpp_tif,
+                        log,
+                    )
+                )
+                modified.add(xref)
+            with tqdm(
+                desc="USER SCRIPT",
+                total=len(futures),
+                unit='image',
+                disable=not options.progress_bar,
+            ) as pbar:
+                for _future in concurrent.futures.as_completed(futures):
+                    pbar.update()
+    
+    for xref in modified:
+        im_obj = pike.get_object(xref, 0)
+        try:
+            pix = leptonica.Pix.open(tif_name(root, xref))
+            if pix.mode == '1':
+                compdata = leptonica.CompressedData.open(tif_name(root, xref))
+            else:
+                log.error("Expected monochrome TIF file but found something else: " + tif_name(root, xref))
+                continue
+        except leptonica.LeptonicaError as e:
+            # Most likely this means file not found, i.e. quantize did not
+            # produce an improved version
+            log.error(e)
+            continue
+
+        # If re-coded image is larger don't use it - we test here because
+        # pngquant knows the size of the temporary output file but not the actual
+        # object in the PDF
+
+        if len(compdata) > int(im_obj.stream_dict.Length):
+            log.debug(
+                f"user script: monochromization did not improve over original image "
+                f"{len(compdata)} > {int(im_obj.stream_dict.Length)}"
+            )
+            continue
+
+        if compdata.type != leptonica.lept.L_G4_ENCODE:
+            log.error("Unexpected compdata.type for " + tif_name(root, xref) + " (should never happen). Skipping.")
+            continue
+
+        rewrite_png_as_g4(pike, im_obj, compdata, log)
+
+
 def transcode_pngs(pike, images, image_name_fn, root, options):
     modified = set()
     if options.optimize >= 2:
@@ -433,6 +495,7 @@ def transcode_pngs(pike, images, image_name_fn, root, options):
 
 def rewrite_png_as_g4(pike, im_obj, compdata):
     im_obj.BitsPerComponent = 1
+    im_obj.ColorSpace = Name("/DeviceGray")
     im_obj.Width = compdata.w
     im_obj.Height = compdata.h
 
@@ -527,6 +590,9 @@ def optimize(input_file, output_file, context, save_settings):
         # Try pngifying the jpegs
         #    transcode_pngs(pike, jpegs, jpg_name, root, options)
         transcode_pngs(pike, pngs, png_name, root, options)
+
+        if (options.user_script_jpg_to_1bpp_tif):
+            transcode_images_via_script_to_tif(pike, jpegs, jpg_name, root, log, options)
 
         jbig2_groups = extract_images_jbig2(pike, root, options)
         convert_to_jbig2(pike, jbig2_groups, root, options)
