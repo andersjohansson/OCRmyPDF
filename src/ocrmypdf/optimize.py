@@ -447,7 +447,7 @@ def transcode_images_via_script_to_tif(pike, images, image_name_fn, root, log, o
             log.error("Unexpected compdata.type for " + tif_name(root, xref) + " (should never happen). Skipping.")
             continue
 
-        rewrite_png_as_g4(pike, im_obj, compdata, log)
+        rewrite_png_as_g4(pike, im_obj, compdata)
 
 
 def transcode_pngs(pike, images, image_name_fn, root, options):
